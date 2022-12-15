@@ -23,8 +23,9 @@
 #include <zephyr/logging/log.h>
 #include <nrf_modem_gnss.h>
 #include <date_time.h>
-
-// LOG_MODULE_REGISTER(gnss_sample, CONFIG_GNSS_SAMPLE_LOG_LEVEL);
+#include <drivers/gpio.h>
+#include <device.h>
+#include <zephyr.h>
 
 #define PI 3.14159265358979323846
 #define EARTH_RADIUS_METERS (6371.0 * 1000.0)
@@ -52,6 +53,9 @@ static struct k_work_delayable ttff_test_prepare_work;
 static struct k_work ttff_test_start_work;
 static uint32_t time_to_fix;
 #endif
+
+#define RED_PIN 10
+#define GREEN_PIN 11
 
 #include "certificates.h"
 
@@ -92,6 +96,10 @@ static K_SEM_DEFINE(time_sem, 0, 1);
 static K_SEM_DEFINE(gps_sem, 0, 1);
 static K_SEM_DEFINE(lte_sem, 0, 1);
 
+static int is_activated = 1;
+static struct device *gpio_dev;
+
+static int not_precise_enough_count = 0;
 
 //gps semaphore
 //lte semaphore
@@ -341,7 +349,7 @@ void mqtt_evt_handler(struct mqtt_client *const c,
 					   p->message.payload.len);
 
 			char message[30];
-			snprintf(message, 30, "%3.7f,%3.7f", last_latitude, last_longitude);
+			snprintf(message, 30, "%3.06f,%3.06f", last_latitude, last_longitude);
 
 			//TODO : Trim array
 
@@ -580,22 +588,17 @@ static int fds_init(struct mqtt_client *c)
 }
 
 #if defined(CONFIG_DK_LIBRARY)
-static void button_handler(uint32_t button_states, uint32_t has_changed)
+static void button_handler(uint32_t button_states, uint32_t has_changed, const struct device *gpio_dev)
 {
 	if (has_changed & button_states &
 		BIT(CONFIG_BUTTON_EVENT_BTN_NUM - 1))
 	{
-		int ret;
-
-		char message[] = "Bonjour";
-
-		ret = data_publish(&client,
-						   MQTT_QOS_1_AT_LEAST_ONCE,
-						   message,
-						   sizeof(message) - 1);
-		if (ret)
-		{
-			LOG_ERR("Publish failed: %d", ret);
+		if (is_activated) {
+			is_activated = 0;
+			turn_pin_on_and_off(RED_PIN);
+		} else {
+			is_activated = 1;
+			turn_pin_on_and_off(GREEN_PIN);
 		}
 	}
 }
@@ -610,7 +613,7 @@ static int modem_configure(void)
 	LOG_INF("Turning on EDRX");
 	//lte_lc_edrx_req(true);
 	char at_buf[100];
-	err = nrf_modem_at_cmd(at_buf, sizeof(at_buf), "AT+CEDRXS=2,4,\"0010\"");
+	err = nrf_modem_at_cmd(at_buf, sizeof(at_buf), "AT+CEDRXS=2,5,\"0100\"");
 	if (err != 0 ) {
 		printf("%s", at_buf);
 		printf("ERROR EDRX-------------------------------------------");
@@ -1172,7 +1175,7 @@ static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
 	printf("Latitude:       %.06f\n", pvt_data->latitude);
 	printf("Longitude:      %.06f\n", pvt_data->longitude);
 	// printf("Altitude:       %.01f m\n", pvt_data->altitude);
-	// printf("Accuracy:       %.01f m\n", pvt_data->accuracy);
+	printf("Accuracy:       %.01f m\n", pvt_data->accuracy);
 	// printf("Speed:          %.01f m/s\n", pvt_data->speed);
 	// printf("Speed accuracy: %.01f m/s\n", pvt_data->speed_accuracy);
 	// printf("Heading:        %.01f deg\n", pvt_data->heading);
@@ -1197,11 +1200,14 @@ void main(void)
 {
 	int err;
 	uint32_t connect_attempt = 0;
-	LOG_INF("The MQTT simple sample started");
+	gpio_dev = device_get_binding("GPIO_0");
+
+	turn_pin_on_and_off(GREEN_PIN);
+
+	dk_buttons_init(button_handler);
 
 	printf("Stopping lte\n");
 	k_sem_take(&lte_sem, K_FOREVER);
-
 
 #if defined(CONFIG_MQTT_LIB_TLS)
 	err = certificates_provision();
@@ -1230,10 +1236,6 @@ void main(void)
 		return;
 	}
 
-#if defined(CONFIG_DK_LIBRARY)
-	dk_buttons_init(button_handler);
-#endif
-
 do_connect:
 	if (connect_attempt++ > 0)
 	{
@@ -1257,18 +1259,6 @@ do_connect:
 
 	while (1)
 	{
-		char at_buf[100];
-		err = nrf_modem_at_cmd(at_buf, sizeof(at_buf), "AT+CEDRXS?");
-		// if (err)
-		// {
-		// 	LOG_ERR("Failed to obtain IMEI, error: %d", err);
-		// }
-
-
-		// printf("%s",at_buf);
-
-		//printf("DATA : long: %.2f ---- lat : %.2f ------------", last_longitude, last_latitude);
-
 		err = poll(&fds, 1, mqtt_keepalive_time_left(&client));
 		if (err < 0)
 		{
@@ -1353,13 +1343,6 @@ void gnss() {
 
 	fix_timestamp = k_uptime_get();
 
-	// printf("Disabling lte");
-	// if (lte_lc_func_mode_set(LTE_LC_FUNC_MODE_DEACTIVATE_LTE) != 0)
-	// {
-	// 	LOG_ERR("Failed to decativate LTE");
-	// 	return;
-	// }
-
 	for (;;)
 	{
 		(void)k_poll(events, 2, K_FOREVER);
@@ -1387,11 +1370,6 @@ void gnss() {
 				{
 					goto handle_nmea;
 				}
-
-				// if (last_pvt.flags & NRF_MODEM_GNSS_PVT_FLAG_FIX_VALID)
-				// {
-				// 	print_distance_from_reference(&last_pvt);
-				// }
 			}
 			else
 			{
@@ -1428,23 +1406,28 @@ void gnss() {
 					last_longitude = last_pvt.longitude;
 					last_latitude = last_pvt.latitude;
 
-					// enable lte
-
-					printf("Enabling lte");
-
 					if (lte_lc_func_mode_set(LTE_LC_FUNC_MODE_NORMAL) != 0)
 					{
 						LOG_ERR("Failed to activate LTE");
 						return;
 					}
 
-					printf("Releasing lte \n");
-					k_sem_give(&lte_sem);
-					
-					printf("Stopping gps after getting fix\n");
-					k_sem_take(&gps_sem, K_FOREVER);
+					int can_send_location = 0;
+					if (not_precise_enough_count > 15) {
+						can_send_location = 1;
+					} else if (last_pvt.accuracy < 10 && not_precise_enough_count > 10) {
+						can_send_location = 1;
+					} else if (last_pvt.accuracy < 5) {
+						can_send_location = 1;
+					} else {
+						not_precise_enough_count++;
+					}
 
-					printf("Deactivating lte \n");
+					if (can_send_location) {
+						not_precise_enough_count = 0;
+						k_sem_give(&lte_sem);
+						k_sem_take(&gps_sem, K_FOREVER);
+					}
 
 					if (lte_lc_func_mode_set(LTE_LC_FUNC_MODE_DEACTIVATE_LTE) != 0)
 					{
@@ -1482,6 +1465,16 @@ void gnss() {
 	}
 
 	return 0;
+}
+
+void turn_pin_on_and_off(int pin) {
+	printf("PIN %i ----------------------", pin);
+	gpio_pin_configure(gpio_dev, pin, GPIO_OUTPUT);
+	k_sleep(K_MSEC(100));
+	gpio_pin_set(gpio_dev, pin, 1);
+	k_sleep(K_MSEC(300));
+	gpio_pin_set(gpio_dev, pin, 0);
+	gpio_pin_configure(gpio_dev, pin, GPIO_DISCONNECTED);
 }
 
 K_THREAD_DEFINE(gps_thread_id, 5000, gnss,
